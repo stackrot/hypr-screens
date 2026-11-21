@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Turn Hyprland monitors on and off from a TUI or a Waybar module.
+
+Screens are the monitors named in the Hyprland Lua config, ordered left
+to right by their configured position (the live one when it is auto),
+so a screen keeps its number while it is off or unplugged. Changes are
+runtime-only.
+
+When every screen has an explicit position, the space left by a screen
+that is off is closed up, so the cursor can cross between its
+neighbours; turning it back on restores the configured layout.
+
+After every change, workspaces stranded on disabled screens move to the
+main screen: the one still on nearest the middle of the layout, right
+of centre on a tie. It is then focused and set as XWayland primary for
+games and X apps.
+
+Screens whose volume can be set over DDC/CI (with ddcutil installed)
+get a volume submenu. This works while a screen is off here and showing
+another input, so it can set the level of a console's audio.
+
+Usage: hypr-screens                      TUI
+       hypr-screens all                  turn every screen on
+       hypr-screens only N               leave only screen N on
+       hypr-screens toggle N             screen 1 is the leftmost
+       hypr-screens volume N LEVEL       set screen N's volume
+       hypr-screens mute N               mute or unmute screen N
+       hypr-screens waybar               Waybar status, kept up to date
+       hypr-screens waybar-install DIR   write Waybar menu and module
+
+Waybar menu actions run through systemd-run when it is available: a bar
+restarted by a monitor change would otherwise kill a change half done.
+"""
+
+import curses
+import fcntl
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from html import escape
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME")
+                  or Path.home() / ".config") / "hypr"
+COMMENT_RE = re.compile(r"--\[(=*)\[.*?\]\1\]|--[^\n]*", re.S)
+RULE_RE = re.compile(r"hl\.monitor\s*\(\s*\{(.*?)\}\s*\)", re.S)
+OUTPUT_RE = re.compile(r"""\boutput\s*=\s*(["'])(.*?)\1""")
+POSITION_RE = re.compile(r"""\bposition\s*=\s*["'](-?\d+)x(-?\d+)["']""")
+VOLUME_RE = re.compile(r"^VCP 62 C \d+ (\d+)", re.M)
+MUTE_RE = re.compile(r"^VCP 8D SNC x0([12])", re.M)
+COMMANDS = {"all": 0, "only": 1, "toggle": 1, "volume": 2, "mute": 1}
+ERRORS = (RuntimeError, subprocess.SubprocessError)
+LEVELS = range(100, 0, -10)
+EVENTS = {"monitoradded", "monitorremoved", "configreloaded"}
+SETTLE_TIMEOUT = 2.0
+ICON_ON = "\U000f0379"
+ICON_OFF = "<span alpha='50%'>\U000f0d90</span>"
+
+
+def query(*args):
+	return json.loads(subprocess.check_output(["hyprctl", *args, "-j"]))
+
+
+def monitors():
+	# FALLBACK is Hyprland's stand-in while no real monitor is on.
+	mons = [m for m in query("monitors", "all") if m["name"] != "FALLBACK"]
+	return sorted(mons, key=lambda m: m["name"])
+
+
+def active():
+	return {m["name"] for m in monitors() if not m["disabled"]}
+
+
+def config_positions():
+	"""Map each output with an hl.monitor rule in the config to its
+	(x, y) position, or None when that is not explicit."""
+	found = {}
+	for path in sorted(CONFIG_DIR.rglob("*.lua")):
+		try:
+			text = COMMENT_RE.sub("", path.read_text())
+		except (OSError, UnicodeDecodeError):
+			continue
+		for rule in RULE_RE.findall(text):
+			out = OUTPUT_RE.search(rule)
+			pos = POSITION_RE.search(rule)
+			if not out or not out[2]:
+				continue
+			if pos:
+				found[out[2]] = (int(pos[1]), int(pos[2]))
+			elif out[2] not in found:
+				found[out[2]] = None
+	return found
+
+
+def matches(output, mon):
+	if output.startswith("desc:"):
+		return mon["description"].startswith(output[5:].strip())
+	return mon["name"] == output
+
+
+def position(entry):
+	output, pos, mon = entry
+	if pos:
+		return pos[0]
+	return mon["x"] if mon else math.inf
+
+
+def screens():
+	"""Every screen left to right, configured or merely connected.
+	"output" is what its rule matches on; x and y are configured."""
+	live = monitors()
+	found = []
+	for output, pos in config_positions().items():
+		mon = next((m for m in live if matches(output, m)), None)
+		if mon:
+			live.remove(mon)
+		found.append((output, pos, mon))
+	found += [(m["name"], None, m) for m in live]
+	found.sort(key=position)
+	return [{"name": mon["name"] if mon else output,
+	         "output": output,
+	         "x": pos[0] if pos else None,
+	         "y": pos[1] if pos else None,
+	         "connected": mon is not None,
+	         "on": mon is not None and not mon["disabled"]}
+	        for output, pos, mon in found]
+
+
+def labels(count):
+	if count == 2:
+		return ["Left", "Right"]
+	if count == 3:
+		return ["Left", "Middle", "Right"]
+	return [f"Screen {i}" for i in range(1, count + 1)]
+
+
+def state(screen):
+	if not screen["connected"]:
+		return "not connected"
+	return "on" if screen["on"] else "off"
+
+
+def hl_eval(lua):
+	res = subprocess.run(["hyprctl", "eval", lua],
+	                     capture_output=True, text=True)
+	if res.returncode != 0:
+		raise RuntimeError(res.stdout.strip() or res.stderr.strip())
+
+
+def lua(value):
+	if isinstance(value, bool):
+		return "true" if value else "false"
+	if isinstance(value, tuple):
+		value = "{}x{}".format(*value)
+	return json.dumps(value, ensure_ascii=False)
+
+
+def rule(output, **fields):
+	# hl.monitor merges into the existing rule for this output, so the
+	# configured mode, scale and so on are kept.
+	body = "".join(f", {k} = {lua(v)}" for k, v in fields.items()
+	               if v is not None)
+	return f"hl.monitor({{ output = {lua(output)}{body} }})"
+
+
+def wait_for(want):
+	# Hyprland applies monitor rules on its next frame, not during the
+	# eval, so poll until the change has landed.
+	deadline = time.monotonic() + SETTLE_TIMEOUT
+	while True:
+		on = active()
+		if all((n in on) == v for n, v in want.items()):
+			return
+		if time.monotonic() > deadline:
+			raise RuntimeError("timed out waiting for Hyprland")
+		time.sleep(0.01)
+
+
+def pick_primary(order, on):
+	"""For three screens: middle, then right, then left."""
+	mid = (len(order) - 1) / 2
+	ranked = sorted(range(len(order)), key=lambda i: (abs(i - mid), -i))
+	return next((order[i] for i in ranked if order[i] in on), None)
+
+
+def layout(shown, final):
+	"""Position of each screen in final: its configured one, shifted
+	left by the width of any screens that are off between it and the
+	leftmost screen that is on."""
+	if any(s["x"] is None for s in shown):
+		return {}
+	pos = {}
+	shift = 0
+	prev = None
+	for i, s in enumerate(shown):
+		if s["name"] not in final:
+			continue
+		if prev is not None and i - prev > 1:
+			shift += s["x"] - shown[prev + 1]["x"]
+		pos[s["name"]] = (s["x"] - shift, s["y"])
+		prev = i
+	return pos
+
+
+def batches(shown, mons, turn_on, turn_off, final):
+	"""Lua for the enabling step, then the disabling one. Screens that
+	move go with whichever step comes first, making room for one that
+	comes on or closing up after one that goes off."""
+	outputs = {s["name"]: s["output"] for s in shown}
+	moves = {n: p for n, p in layout(shown, final).items()
+	         if n in turn_on or (mons[n]["x"], mons[n]["y"]) != p}
+	up = [rule(outputs[n], disabled=False, position=moves.get(n))
+	      for n in turn_on]
+	down = [rule(outputs[n], disabled=True) for n in turn_off]
+	shift = [rule(outputs[n], position=p)
+	         for n, p in moves.items() if n not in turn_on]
+	if up or not down:
+		return up + shift, down
+	return up, down + shift
+
+
+def apply(want):
+	"""Enable before disabling so there is never a moment with no
+	monitor: Hyprland would create a FALLBACK output and drop it a
+	frame later, and clients still binding it get disconnected."""
+	mons = {m["name"]: m for m in monitors()}
+	on = {n for n, m in mons.items() if not m["disabled"]}
+	want = {n: v for n, v in want.items() if n in mons}
+	turn_on = [n for n, v in want.items() if v and n not in on]
+	turn_off = [n for n, v in want.items() if not v and n in on]
+	final = (on | set(turn_on)) - set(turn_off)
+	shown = screens()
+	primary = pick_primary([s["name"] for s in shown], final)
+	if not primary:
+		raise RuntimeError("refusing to disable every monitor")
+	stranded = {ws["id"] for ws in query("workspaces")
+	            if ws["id"] > 0 and ws["monitor"] in turn_off}
+	up, down = batches(shown, mons, turn_on, turn_off, final)
+	if up:
+		hl_eval(" ".join(up))
+		wait_for(dict.fromkeys(turn_on, True))
+	if down:
+		hl_eval(" ".join(down))
+		wait_for(want)
+	settle(primary, stranded)
+
+
+def settle(primary, stranded):
+	# Hyprland has already parked stranded workspaces on its first
+	# remaining monitor, which is not necessarily the primary one.
+	mon = f'hl.get_monitor("{primary}")'
+	lua = [f"hl.dispatch(hl.dsp.workspace.move({{ workspace ="
+	       f' hl.get_workspace({ws["id"]}), monitor = {mon} }}))'
+	       for ws in query("workspaces")
+	       if ws["id"] in stranded and ws["monitor"] != primary]
+	lua.append(f"hl.dispatch(hl.dsp.focus({{ monitor = {mon} }}))")
+	hl_eval(" ".join(lua))
+	if shutil.which("xrandr"):
+		subprocess.run(["xrandr", "--output", primary, "--primary"],
+		               capture_output=True)
+
+
+def ddc_bus(name):
+	# DisplayPort monitors answer on the AUX channel's bus under the
+	# connector, not on its ddc link.
+	for conn in Path("/sys/class/drm").glob(f"card*-{name}"):
+		for path in [*conn.glob("i2c-*"), conn / "ddc"]:
+			if path.exists():
+				return path.resolve().name.removeprefix("i2c-")
+	return None
+
+
+def ddc(name, *args):
+	bus = ddc_bus(name)
+	if not bus or not shutil.which("ddcutil"):
+		raise RuntimeError(f"no DDC/CI for {name}")
+	res = subprocess.run(["ddcutil", "--bus", bus, "--brief", *args],
+	                     capture_output=True, text=True, timeout=15)
+	if res.returncode != 0:
+		err = res.stderr.strip() or f"ddcutil failed on {name}"
+		raise RuntimeError(err)
+	return res.stdout
+
+
+def audio(name):
+	"""Maximum volume (None without volume control) and whether mute
+	is supported, over DDC/CI."""
+	try:
+		out = ddc(name, "getvcp", "62", "8d")
+	except ERRORS:
+		return None, False
+	top = VOLUME_RE.search(out)
+	return int(top[1]) if top else None, bool(MUTE_RE.search(out))
+
+
+def toggle_mute(name):
+	muted = MUTE_RE.search(ddc(name, "getvcp", "8d"))
+	value = "2" if muted and muted[1] == "1" else "1"
+	ddc(name, "--noverify", "setvcp", "8d", value)
+
+
+def pick(shown, arg):
+	if not arg.isdigit() or not 1 <= int(arg) <= len(shown):
+		raise RuntimeError(f"no screen {arg}")
+	screen = shown[int(arg) - 1]
+	if not screen["connected"]:
+		raise RuntimeError(f"{screen['name']} is not connected")
+	return screen
+
+
+def run(action, *args):
+	# Clicks can overlap; each change must start from settled state.
+	lock = f'{os.environ["XDG_RUNTIME_DIR"]}/hypr-screens.lock'
+	with open(lock, "w") as f:
+		fcntl.flock(f, fcntl.LOCK_EX)
+		shown = screens()
+		if action == "all":
+			apply({s["name"]: True for s in shown})
+			return
+		target = pick(shown, args[0])
+		if action == "only":
+			apply({s["name"]: s is target for s in shown})
+		elif action == "toggle":
+			apply({target["name"]: not target["on"]})
+		elif action == "mute":
+			toggle_mute(target["name"])
+		elif args[1].isdigit():
+			level = args[1]
+			ddc(target["name"], "--noverify", "setvcp", "62", level)
+		else:
+			raise RuntimeError(f"bad volume {args[1]}")
+
+
+def put(scr, y, text, attr=0):
+	height, width = scr.getmaxyx()
+	if y < height:
+		scr.addnstr(y, 0, text, width - 1, attr)
+
+
+def draw(scr, shown, sel, status):
+	scr.erase()
+	put(scr, 0, "Screens  (space/1-9: toggle, a: all on, q: quit)",
+	    curses.A_BOLD)
+	for i, (label, s) in enumerate(zip(labels(len(shown)), shown)):
+		row = f" {i + 1}  {label:<9} {s['name']:<10} {state(s)}"
+		put(scr, i + 2, row, curses.A_REVERSE if i == sel else 0)
+	put(scr, len(shown) + 3, status)
+
+
+def tui(scr):
+	curses.curs_set(0)
+	curses.set_escdelay(25)
+	sel = 0
+	status = ""
+	while True:
+		shown = screens()
+		sel = min(sel, len(shown) - 1)
+		draw(scr, shown, sel, status)
+		key = scr.getch()
+		status = ""
+		cmd = None
+		if key in (ord("q"), 27):
+			break
+		if key in (curses.KEY_UP, ord("k")):
+			sel = max(sel - 1, 0)
+		elif key in (curses.KEY_DOWN, ord("j")):
+			sel = min(sel + 1, len(shown) - 1)
+		elif key in (ord(" "), ord("\n")):
+			cmd = ("toggle", str(sel + 1))
+		elif key == ord("a"):
+			cmd = ("all",)
+		elif ord("1") <= key <= ord("9"):
+			cmd = ("toggle", chr(key))
+		if not cmd:
+			continue
+		try:
+			run(*cmd)
+		except ERRORS as e:
+			status = str(e)
+
+
+def waybar_line():
+	shown = screens()
+	text = " ".join(ICON_ON if s["on"] else ICON_OFF for s in shown)
+	tip = "\n".join(f"{label} ({escape(s['name'])}): {state(s)}"
+	                for label, s in zip(labels(len(shown)), shown))
+	return json.dumps({"text": text, "tooltip": tip})
+
+
+def watch():
+	path = (f'{os.environ["XDG_RUNTIME_DIR"]}/hypr/'
+	        f'{os.environ["HYPRLAND_INSTANCE_SIGNATURE"]}/.socket2.sock')
+	with socket.socket(socket.AF_UNIX) as sock:
+		# Subscribe before the first query so no change slips between.
+		sock.connect(path)
+		print(waybar_line(), flush=True)
+		for line in sock.makefile():
+			if line.split(">>", 1)[0] in EVENTS:
+				print(waybar_line(), flush=True)
+
+
+def volume_menu(index, label, name):
+	top, mute = audio(name)
+	if top is None:
+		return None
+	items = [(f"volume-{index}-{round(top * p / 100)}", f"{p}%", None)
+	         for p in LEVELS]
+	if mute:
+		items += [None, (f"mute-{index}", "Mute / unmute", None)]
+	return (None, f"{label} volume", items)
+
+
+def menu_items():
+	"""Menu entries as (id, label, submenu entries or None), or None
+	for a separator. An id is also the command it runs, with dashes
+	for spaces."""
+	shown = screens()
+	names = labels(len(shown))
+	lower = [n.lower() for n in names]
+	toggles = [(f"toggle-{i}", f"Toggle {n}", None)
+	           for i, n in enumerate(lower, 1)]
+	only = [(f"only-{i}", f"Only {n}", None)
+	        for i, n in enumerate(lower, 1)]
+	volumes = [volume_menu(i, n, s["name"])
+	           for i, (n, s) in enumerate(zip(names, shown), 1)
+	           if s["connected"]]
+	volumes = [v for v in volumes if v]
+	entries = [("all", "All screens", None), None, *toggles, None, *only]
+	return entries + [None, *volumes] if volumes else entries
+
+
+def build_menu(parent, entries):
+	for entry in entries:
+		child = ET.SubElement(parent, "child")
+		if entry is None:
+			sep = {"class": "GtkSeparatorMenuItem"}
+			ET.SubElement(child, "object", sep)
+			continue
+		key, label, children = entry
+		attrs = {"class": "GtkMenuItem"}
+		if key:
+			attrs["id"] = key
+		obj = ET.SubElement(child, "object", attrs)
+		ET.SubElement(obj, "property", {"name": "label"}).text = label
+		if children:
+			sub = ET.SubElement(obj, "child", {"type": "submenu"})
+			attrs = {"class": "GtkMenu"}
+			menu = ET.SubElement(sub, "object", attrs)
+			build_menu(menu, children)
+
+
+def action_ids(entries):
+	for entry in entries:
+		if entry is None:
+			continue
+		if entry[2]:
+			yield from action_ids(entry[2])
+		else:
+			yield entry[0]
+
+
+def waybar_menu(entries):
+	root = ET.Element("interface")
+	menu = ET.SubElement(root, "object", {"class": "GtkMenu", "id": "menu"})
+	build_menu(menu, entries)
+	ET.indent(root, space="\t")
+	return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+	        + ET.tostring(root, encoding="unicode") + "\n")
+
+
+def waybar_module(entries, menu):
+	exe = shlex.quote(os.path.abspath(sys.argv[0]))
+	prefix = exe
+	if shutil.which("systemd-run"):
+		prefix = f"systemd-run --user --collect --quiet {exe}"
+	actions = {key: f"{prefix} {key.replace('-', ' ')}"
+	           for key in action_ids(entries)}
+	module = {
+		"exec": f"{exe} waybar",
+		"return-type": "json",
+		"menu": "on-click",
+		"menu-file": menu,
+		"menu-actions": actions,
+	}
+	return json.dumps({"custom/screens": module}, indent=4) + "\n"
+
+
+def waybar_install(dest):
+	entries = menu_items()
+	menu = Path(dest) / "menu.xml"
+	menu.write_text(waybar_menu(entries))
+	module = Path(dest) / "module.json"
+	module.write_text(waybar_module(entries, str(menu)))
+
+
+def main(args):
+	if not args:
+		curses.wrapper(tui)
+	elif args == ["waybar"]:
+		watch()
+	elif len(args) == 2 and args[0] == "waybar-install":
+		waybar_install(args[1])
+	elif args[0] in COMMANDS and len(args) == 1 + COMMANDS[args[0]]:
+		try:
+			run(*args)
+		except ERRORS as e:
+			sys.exit(str(e))
+	else:
+		sys.exit(__doc__)
+
+
+main(sys.argv[1:])
