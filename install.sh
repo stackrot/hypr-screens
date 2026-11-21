@@ -20,7 +20,7 @@ for cmd in hyprctl python3 waybar; do
 	command -v "$cmd" >/dev/null || die "$cmd is not installed"
 done
 [[ -f $config_home/hypr/hyprland.lua ]] ||
-	die "needs Hyprland 0.55 or later with a hyprland.lua config"
+	die "needs Hyprland 0.55.1 or later with a hyprland.lua config"
 hyprctl monitors >/dev/null 2>&1 || die "run this from inside Hyprland"
 
 config=""

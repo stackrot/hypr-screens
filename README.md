@@ -22,7 +22,7 @@ turns every screen back on.
 
 ## Requirements
 
-- Hyprland 0.55 or newer with a `hyprland.lua` config. Monitors have to be
+- Hyprland 0.55.1 or newer with a `hyprland.lua` config. Monitors have to be
   set with plain `hl.monitor({ ... })` calls. Rules built in a loop or from
   variables aren't picked up.
 - Waybar and Python 3.
