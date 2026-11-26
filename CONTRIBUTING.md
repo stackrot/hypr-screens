@@ -59,10 +59,17 @@ code.
 
 ## Development
 
-There's nothing to build, and there are no tests or linters. You need the
-requirements in `README.md`. To try a change, run the installer from inside
-Hyprland. It copies `hypr-screens` to `~/.local/bin` and writes the Waybar
-menu and module:
+There's nothing to build and there are no tests. CI runs ShellCheck on the
+installer and a syntax check on the script, so run both before you push:
+
+```
+shellcheck install.sh
+python3 -m py_compile hypr-screens
+```
+
+You need the requirements in `README.md`. To try a change, run the
+installer from inside Hyprland. It copies `hypr-screens` to `~/.local/bin`
+and writes the Waybar menu and module:
 
 ```
 ./install.sh
